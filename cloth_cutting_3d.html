@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Layer Destructible Engine</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #050505; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; cursor: crosshair; }
+        
+        #ui {
+            position: absolute; top: 20px; left: 20px;
+            background: rgba(10, 10, 10, 0.85); 
+            color: #eee; padding: 15px; border-radius: 8px;
+            border: 1px solid #333; pointer-events: none;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+            width: 240px;
+        }
+
+        #controls {
+            position: absolute; top: 20px; right: 20px;
+            display: flex; flex-direction: column; gap: 10px;
+            align-items: flex-end;
+        }
+
+        button {
+            padding: 8px 16px; border: none; border-radius: 4px;
+            background: #222; color: #ccc; cursor: pointer;
+            font-size: 12px; font-weight: 600; text-transform: uppercase;
+            border: 1px solid #444; transition: 0.2s; min-width: 80px;
+        }
+        button:hover { background: #444; color: #fff; }
+        button.active { background: #4fd1c5; color: #111; border-color: #4fd1c5; }
+        
+        .btn-group { display: flex; gap: 4px; }
+        .label { font-size: 10px; color: #777; font-weight: bold; letter-spacing: 1px; margin-bottom: 4px; }
+        .separator { height: 1px; background: #333; margin: 5px 0; width: 100%; }
+        .accent { color: #4fd1c5; }
+
+        h2 { margin: 0 0 5px 0; font-size: 16px; color: #fff; letter-spacing: 0.5px; }
+        p { margin: 0; font-size: 12px; opacity: 0.6; line-height: 1.4; }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <h2>Destructible Layers</h2>
+    <p>• <span class="accent">Drag BG:</span> Orbit Camera</p>
+    <p>• <span class="accent">Action:</span> Cuts only top layer</p>
+    <div class="separator"></div>
+    <p style="color:#f6ad55;" id="tool-display">Tool: Knife</p>
+</div>
+
+<div id="controls">
+    <div>
+        <div class="label">Render Mode</div>
+        <div class="btn-group">
+            <button onclick="setView('textured')" id="view-textured" class="active">Solid</button>
+            <button onclick="setView('wireframe')" id="view-wireframe">Wire</button>
+        </div>
+    </div>
+
+    <div>
+        <div class="label">Material</div>
+        <div class="btn-group">
+            <button onclick="setMaterial('cotton')" id="btn-cotton" class="active">Cotton</button>
+            <button onclick="setMaterial('nylon')" id="btn-nylon">Nylon</button>
+            <button onclick="setMaterial('denim')" id="btn-denim">Denim</button>
+        </div>
+    </div>
+
+    <div>
+        <div class="label">Tool</div>
+        <div class="btn-group">
+            <button onclick="setTool('knife')" id="tool-knife" class="active">Knife</button>
+            <button onclick="setTool('lighter')" id="tool-lighter" style="color:#f6ad55;">Fire</button>
+        </div>
+    </div>
+
+    <div style="margin-top:5px; width: 100%;">
+        <button onclick="toggleWind()" id="btn-wind" style="width:100%">Wind: OFF</button>
+    </div>
+
+    <button onclick="initWorld()" style="background:#882222; margin-top:10px; width:100%; border:none; color:white;">Reset</button>
+</div>
+
+<canvas id="c"></canvas>
+
+<script>
+// -----------------------------------------------------------
+// CONFIGURATION
+// -----------------------------------------------------------
+
+// We define the layers here. The 'Top' layer is last.
+// Input will check layers in REVERSE order (Top to Bottom).
+const LAYER_CONFIG = [
+    { name: "Base",  x: 25, y: 25, z: 20, color: '#4b0082' }, 
+    { name: "Mid1",  x: 15, y: 15, z: 10, color: '#004488' }, 
+    { name: "Mid2",  x: 8,  y: 8,  z: 5,  color: '#0088aa' }, 
+    { name: "Top",   x: 0,  y: 0,  z: 0,  color: null }      // Null = Use Material Color
+];
+
+const CAMERA = {
+    x: 0, y: 0, z: -700, 
+    rotX: 15 * (Math.PI/180), 
+    rotY: 0,
+    zoom: 1.0,
+    focus: 600 
+};
+
+// Texture
+let clothPattern = null;
+function generateFabricPattern() {
+    const pCanvas = document.createElement('canvas');
+    pCanvas.width = 64; pCanvas.height = 64;
+    const pCtx = pCanvas.getContext('2d');
+    pCtx.fillStyle = '#ffffff'; pCtx.fillRect(0,0,64,64);
+    pCtx.fillStyle = 'rgba(0,0,0,0.1)';
+    for(let i=0; i<400; i++) pCtx.fillRect(Math.random()*64, Math.random()*64, 2, 2);
+    return ctx.createPattern(pCanvas, 'repeat');
+}
+
+// Reduced resolution slightly to handle 4x physics load
+const GRID = { cols: 32, rows: 26, spacing: 15 };
+const TEAR_SENSITIVITY = 5;
+
+const MATERIALS = {
+    cotton: { friction: 0.96, gravity: 0.25, stiffness: 3, color: '#e0e0e0', burnRate: 1.0, windMod: 1.0 },
+    nylon: { friction: 0.99, gravity: 0.25, stiffness: 8, color: '#ff00aa', burnRate: 3.5, windMod: 2.5 }, 
+    denim: { friction: 0.90, gravity: 0.45, stiffness: 12, color: '#6080b0', burnRate: 0.5, windMod: 0.5 } 
+};
+
+let currentMat = MATERIALS.cotton;
+let currentTool = 'knife';
+let viewMode = 'textured';
+let windEnabled = false;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let width, height;
+const mouse = { x: 0, y: 0, px: 0, py: 0, down: false, button: 0 };
+let draggedPoint = null;
+let isRotating = false;
+
+clothPattern = generateFabricPattern();
+
+function resize() {
+    width = canvas.width = window.innerWidth;
+    height = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// -----------------------------------------------------------
+// PHYSICS CLASSES
+// -----------------------------------------------------------
+
+class Point {
+    constructor(x, y, z, pinned) {
+        this.x = x; this.y = y; this.z = z;
+        this.px = x; this.py = y; this.pz = z;
+        this.pinned = pinned;
+        this.sx = 0; this.sy = 0; this.depth = 0;
+    }
+
+    update() {
+        if (this.pinned) return;
+        if (this === draggedPoint) return;
+
+        let vx = (this.x - this.px) * currentMat.friction;
+        let vy = (this.y - this.py) * currentMat.friction;
+        let vz = (this.z - this.pz) * currentMat.friction;
+
+        if (windEnabled) {
+            const time = Date.now() / 300;
+            let wave = Math.sin(this.y * 0.02 + time) * 0.8;
+            wave += Math.sin(this.x * 0.03 + time * 2.5) * 0.4;
+            vz += wave * 1.5 * currentMat.windMod; 
+            vx += wave * 0.2 * currentMat.windMod;
+        }
+
+        this.px = this.x; this.py = this.y; this.pz = this.z;
+        this.x += vx; this.y += vy; this.z += vz;
+        this.y += currentMat.gravity;
+    }
+
+    project() {
+        // Center the cloth in world space based on grid size
+        let cx = this.x - (GRID.cols * GRID.spacing)/2;
+        let cy = this.y - 100;
+        let cz = this.z;
+
+        let cosY = Math.cos(CAMERA.rotY);
+        let sinY = Math.sin(CAMERA.rotY);
+        let rx = cx * cosY - cz * sinY;
+        let rz = cz * cosY + cx * sinY;
+
+        let cosX = Math.cos(CAMERA.rotX);
+        let sinX = Math.sin(CAMERA.rotX);
+        let ry = cy * cosX - rz * sinX;
+        rz = rz * cosX + cy * sinX;
+
+        rz += CAMERA.focus;
+        if (rz < 10) rz = 10; 
+        
+        const scale = CAMERA.focus / rz * CAMERA.zoom;
+        this.sx = rx * scale + width/2;
+        this.sy = ry * scale + height/2;
+        this.depth = rz; 
+    }
+}
+
+class Stick {
+    constructor(p1, p2, isStructural) {
+        this.p1 = p1; this.p2 = p2;
+        this.length = Math.hypot(p1.x - p2.x, p1.y - p2.y, p1.z - p2.z);
+        this.active = true;
+        this.isStructural = isStructural;
+        this.health = 100;
+    }
+
+    update() {
+        if (!this.active) return;
+        const dx = this.p2.x - this.p1.x;
+        const dy = this.p2.y - this.p1.y;
+        const dz = this.p2.z - this.p1.z;
+        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        
+        if (dist > this.length * TEAR_SENSITIVITY) this.active = false;
+
+        const diff = (this.length - dist) / dist * 0.5;
+        const offsetX = dx * diff; const offsetY = dy * diff; const offsetZ = dz * diff;
+
+        if (!this.p1.pinned && this.p1 !== draggedPoint) { 
+            this.p1.x -= offsetX; this.p1.y -= offsetY; this.p1.z -= offsetZ;
+        }
+        if (!this.p2.pinned && this.p2 !== draggedPoint) { 
+            this.p2.x += offsetX; this.p2.y += offsetY; this.p2.z += offsetZ;
+        }
+    }
+}
+
+// -----------------------------------------------------------
+// CLOTH INSTANCE (Represents 1 Layer)
+// -----------------------------------------------------------
+
+class ClothInstance {
+    constructor(config) {
+        this.points = [];
+        this.sticks = [];
+        this.triangles = [];
+        this.config = config; // Contains color, offset x/y/z
+        this.init();
+    }
+
+    init() {
+        // Offset the starting position based on layer config
+        const startX = this.config.x;
+        const startY = this.config.y;
+        const startZ = this.config.z || 0;
+
+        // Points
+        for (let y = 0; y < GRID.rows; y++) {
+            for (let x = 0; x < GRID.cols; x++) {
+                const pinned = y === 0;
+                this.points.push(new Point(
+                    startX + x * GRID.spacing, 
+                    startY + y * GRID.spacing, 
+                    startZ + Math.random()*2, 
+                    pinned
+                ));
+            }
+        }
+
+        // Constraints
+        for (let y = 0; y < GRID.rows; y++) {
+            for (let x = 0; x < GRID.cols; x++) {
+                const i = y * GRID.cols + x;
+                
+                if (x < GRID.cols - 1) this.sticks.push(new Stick(this.points[i], this.points[i+1], true));
+                if (y < GRID.rows - 1) this.sticks.push(new Stick(this.points[i], this.points[i+GRID.cols], true));
+                
+                if (x < GRID.cols - 1 && y < GRID.rows - 1) {
+                    // Shear
+                    this.sticks.push(new Stick(this.points[i], this.points[i+GRID.cols+1], false));
+                    this.sticks.push(new Stick(this.points[i+1], this.points[i+GRID.cols], false));
+                    
+                    // Triangles for rendering
+                    const p1 = this.points[i];
+                    const p2 = this.points[i+1];
+                    const p3 = this.points[i + GRID.cols];
+                    const p4 = this.points[i + GRID.cols + 1];
+                    this.triangles.push({ p: [p1, p2, p3], depth: 0 });
+                    this.triangles.push({ p: [p2, p4, p3], depth: 0 });
+                }
+            }
+        }
+    }
+
+    updatePhysics() {
+        for (const p of this.points) p.update();
+        for (let i = 0; i < currentMat.stiffness; i++) {
+            for (const s of this.sticks) s.update();
+        }
+    }
+
+    projectPoints() {
+        for (const p of this.points) p.project();
+    }
+}
+
+// -----------------------------------------------------------
+// WORLD MANAGER
+// -----------------------------------------------------------
+
+let cloths = []; // Array of ClothInstance
+
+function initWorld() {
+    cloths = [];
+    draggedPoint = null;
+    // Create an instance for each layer config
+    for (const cfg of LAYER_CONFIG) {
+        cloths.push(new ClothInstance(cfg));
+    }
+}
+
+// -----------------------------------------------------------
+// VIEW CONTROLS
+// -----------------------------------------------------------
+
+function setMaterial(name) {
+    currentMat = MATERIALS[name];
+    document.querySelectorAll('#controls button').forEach(b => b.classList.remove('active'));
+    document.getElementById('btn-'+name).classList.add('active');
+    document.getElementById('tool-'+currentTool).classList.add('active');
+    document.getElementById('view-'+viewMode).classList.add('active');
+    updateWindButton();
+}
+function setTool(name) {
+    currentTool = name;
+    document.getElementById('tool-knife').classList.remove('active');
+    document.getElementById('tool-lighter').classList.remove('active');
+    document.getElementById('tool-'+name).classList.add('active');
+    document.getElementById('tool-display').innerText = "Tool: " + (name === 'knife' ? "Knife" : "Fire");
+    document.getElementById('tool-display').style.color = name === 'knife' ? "#eee" : "#f6ad55";
+}
+function setView(mode) {
+    viewMode = mode;
+    document.getElementById('view-wireframe').classList.remove('active');
+    document.getElementById('view-textured').classList.remove('active');
+    document.getElementById('view-'+mode).classList.add('active');
+}
+function toggleWind() { windEnabled = !windEnabled; updateWindButton(); }
+function updateWindButton() {
+    const btn = document.getElementById('btn-wind');
+    btn.innerText = windEnabled ? "Wind: GALE" : "Wind: OFF";
+    btn.style.background = windEnabled ? "#4fd1c5" : "#333";
+    btn.style.color = windEnabled ? "#111" : "#fff";
+}
+
+// -----------------------------------------------------------
+// RENDERING & INTERACTION
+// -----------------------------------------------------------
+
+function isTorn(pA, pB, pC) {
+    const limit = GRID.spacing * 3.0; 
+    const d1 = Math.hypot(pB.x - pA.x, pB.y - pA.y, pB.z - pA.z);
+    if(d1 > limit) return true;
+    const d2 = Math.hypot(pC.x - pB.x, pC.y - pB.y, pC.z - pB.z);
+    if(d2 > limit) return true;
+    const d3 = Math.hypot(pA.x - pC.x, pA.y - pC.y, pA.z - pC.z);
+    if(d3 > limit) return true;
+    return false;
+}
+
+function update() {
+    ctx.clearRect(0, 0, width, height);
+
+    // 1. Physics & Projection for ALL layers
+    for (const c of cloths) {
+        c.updatePhysics();
+        c.projectPoints();
+    }
+
+    // 2. Interaction
+    handleInput();
+
+    // 3. Render
+    // We draw from bottom layer (Index 0) to Top Layer (Index Length-1)
+    // so top layers cover bottom layers naturally
+    for (const c of cloths) {
+        
+        if (viewMode === 'textured') {
+            // Sort triangles for this specific cloth
+            for(const tri of c.triangles) tri.depth = (tri.p[0].depth + tri.p[1].depth + tri.p[2].depth) / 3;
+            c.triangles.sort((a, b) => b.depth - a.depth);
+
+            for (const tri of c.triangles) {
+                const p1 = tri.p[0]; const p2 = tri.p[1]; const p3 = tri.p[2];
+
+                if (p1.depth < 0 || p2.depth < 0 || p3.depth < 0) continue;
+                if (isTorn(p1, p2, p3)) continue;
+
+                ctx.beginPath();
+                ctx.moveTo(p1.sx, p1.sy);
+                ctx.lineTo(p2.sx, p2.sy);
+                ctx.lineTo(p3.sx, p3.sy);
+                
+                if (c.config.color) {
+                     // Bottom Layers
+                     ctx.fillStyle = c.config.color;
+                     ctx.globalAlpha = 0.9;
+                } else {
+                     // Top Layer (Texture)
+                     ctx.fillStyle = clothPattern;
+                }
+                ctx.fill();
+
+                // Tint for Top Layer
+                if (!c.config.color) {
+                    ctx.fillStyle = currentMat.color;
+                    ctx.globalAlpha = 0.5;
+                    ctx.fill();
+                    ctx.globalAlpha = 1.0;
+                }
+            }
+        } else {
+            // Wireframe
+            ctx.lineWidth = c.config.color ? 2 : 1.5;
+            const drawColor = c.config.color ? c.config.color : currentMat.color;
+            
+            for (const s of c.sticks) {
+                if (!s.active || !s.isStructural) continue;
+                if (s.p1.depth < 0 || s.p2.depth < 0) continue;
+
+                ctx.beginPath();
+                ctx.moveTo(s.p1.sx, s.p1.sy);
+                ctx.lineTo(s.p2.sx, s.p2.sy);
+                
+                // Show heat on top layer only
+                if (!c.config.color && s.health < 100) {
+                     const br = s.health / 100;
+                     ctx.strokeStyle = `rgb(255,${Math.floor(155*br)},0)`;
+                } else {
+                    ctx.strokeStyle = drawColor;
+                }
+                ctx.stroke();
+            }
+        }
+    }
+
+    if (currentTool === 'lighter' && !isRotating) {
+        ctx.beginPath(); ctx.arc(mouse.x, mouse.y, 25, 0, Math.PI*2);
+        ctx.fillStyle = 'rgba(255, 100, 0, 0.2)'; ctx.fill();
+    }
+
+    mouse.px = mouse.x; mouse.py = mouse.y;
+    requestAnimationFrame(update);
+}
+
+// -----------------------------------------------------------
+// OCCLUSION-BASED INPUT HANDLING
+// -----------------------------------------------------------
+
+function handleInput() {
+    if (!mouse.down || isRotating) return;
+    if (mouse.button === 0) { 
+        
+        let actionHandled = false; 
+        for (let i = cloths.length - 1; i >= 0; i--) {
+            const c = cloths[i];
+            
+           
+            if (actionHandled) break; 
+
+            if (currentTool === 'knife') {
+                for (const s of c.sticks) {
+                    if (!s.active || s.p1.depth < 0) continue;
+                    const mx = (s.p1.sx + s.p2.sx)/2;
+                    const my = (s.p1.sy + s.p2.sy)/2;
+                    // Check if mouse hits this stick
+                    if (Math.hypot(mx - mouse.x, my - mouse.y) < 10) {
+                        s.active = false;
+                        actionHandled = true; 
+                    }
+                }
+            } 
+            else if (currentTool === 'lighter') {
+                for (const s of c.sticks) {
+                    if (!s.active || s.p1.depth < 0) continue;
+                    const mx = (s.p1.sx + s.p2.sx)/2;
+                    const my = (s.p1.sy + s.p2.sy)/2;
+                    if (Math.hypot(mx - mouse.x, my - mouse.y) < 25) {
+                        s.health -= 5 * currentMat.burnRate;
+                        if (s.health <= 0) s.active = false;
+                        actionHandled = true; 
+                    }
+                }
+            }
+        }
+    }
+}
+
+canvas.addEventListener('mousedown', e => {
+    mouse.down = true; mouse.button = e.button;
+    mouse.px = e.clientX; mouse.py = e.clientY;
+    mouse.x = e.clientX; mouse.y = e.clientY;
+
+    let hitCloth = false;
+    for (const c of cloths) {
+        for(const p of c.points) {
+            if (p.depth > 0 && Math.hypot(p.sx - mouse.x, p.sy - mouse.y) < 20) {
+                hitCloth = true; break;
+            }
+        }
+        if(hitCloth) break;
+    }
+
+    if (!hitCloth) {
+        isRotating = true;
+    } else if (e.button === 2) { 
+         let minD = 40, closest = null;
+         for (const c of cloths) {
+             for(const p of c.points) {
+                 if (p.depth < 0) continue;
+                 const d = Math.hypot(p.sx - mouse.x, p.sy - mouse.y);
+                 if (d < minD) { minD = d; closest = p; }
+             }
+         }
+         if (closest) draggedPoint = closest;
+    }
+});
+
+canvas.addEventListener('mousemove', e => {
+    mouse.x = e.clientX; mouse.y = e.clientY;
+    
+    if (isRotating && mouse.down) {
+        const dx = (e.clientX - mouse.px) * 0.005;
+        const dy = (e.clientY - mouse.py) * 0.005;
+        CAMERA.rotY += dx;
+        CAMERA.rotX += dy;
+        CAMERA.rotX = Math.max(-1.5, Math.min(1.5, CAMERA.rotX));
+    } else if (draggedPoint) {
+         const sensitivity = draggedPoint.depth / CAMERA.focus;
+         draggedPoint.x += (e.clientX - mouse.px) * sensitivity;
+         draggedPoint.y += (e.clientY - mouse.py) * sensitivity;
+    }
+});
+
+canvas.addEventListener('mouseup', () => { 
+    mouse.down = false; isRotating = false; draggedPoint = null; 
+});
+canvas.addEventListener('wheel', e => {
+    CAMERA.zoom *= (e.deltaY > 0 ? 0.9 : 1.1);
+    CAMERA.zoom = Math.max(0.1, Math.min(5, CAMERA.zoom));
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+initWorld();
+updateWindButton();
+update();
+
+</script>
+</body>
+</html>
